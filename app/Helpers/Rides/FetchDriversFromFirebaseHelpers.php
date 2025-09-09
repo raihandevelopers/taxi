@@ -255,6 +255,9 @@ trait FetchDriversFromFirebaseHelpers
                 ->where('approve', 1)
                 ->whereIn('id', $nearest_driver_ids)
                 ->whereNotIn('id', $meta_drivers)
+                ->when(isset($user_detail) && !empty($user_detail->gender), function($query) use ($user_detail) {
+                    $query->where('gender', $user_detail->gender);
+                })
                 ->orderByRaw("FIELD(id, ?)", [implode(',', $nearest_driver_ids)]) // Corrected usage here
                 ->limit(10)
                 ->get();
