@@ -69,296 +69,276 @@ class CreateRequestController extends StripeController
     * @responseFile responses/requests/create-request.json
     *
     */
-    public function createRequest(CreateTripRequest $request)
-    {
-       
-        /**
-        * Check if the user has registred a trip already
-        * Validate payment option is available.
-        * if card payment choosen, then we need to check if the user has added thier card.
-        * if the paymenr opt is wallet, need to check the if the wallet has enough money to make the trip request
-        * Check if thge user created a trip and waiting for a driver to accept. if it is we need to cancel the exists trip and create new one
-        * Find the zone using the pickup coordinates & get the nearest drivers
-        * create request along with place details
-        * assing driver to the trip depends the assignment method
-        * send emails and sms & push notifications to the user& drivers as well.
-        */
-        // Check whether the trip is schedule ride or not
-        // Log::info("create Request");
-        // Log::info($request->all());
-        // Log::info("create Request");
-        // Log::info($request->all());
+  public function createRequest(CreateTripRequest $request)
+{
+    // NOTE: CreateTripRequest should already validate required fields.
+    // Additional validation for price_per_time can be added here if needed.
 
-        if ($request->has('is_later') && $request->is_later) {
-            return $this->createRideLater($request);
+    // If scheduled ride -> delegate
+    if ($request->has('is_later') && $request->is_later) {
+        return $this->createRideLater($request);
+    }
+
+    // Cancel any existing pending request for this user (existing behavior)
+    $request_meta_with_current_user = RequestMeta::where('user_id', auth()->user()->id);
+    $check_request_data_with_user = $request_meta_with_current_user->exists();
+    if ($check_request_data_with_user) {
+        $request_with_user = $request_meta_with_current_user->pluck('request_id')->first();
+        if ($request_with_user) {
+            $this->request->where('id', $request_with_user)
+                ->update(['is_cancelled' => 1, 'cancel_method' => 1, 'cancelled_at' => date('Y-m-d H:i:s')]);
         }
+        $request_meta_with_current_user->delete();
+    }
 
-        // Validate payment option is available.
-        // @TODO
-        //Check if thge user created a trip and waiting for a driver to accept. if it is we need to cancel the exists trip and create new one
-        $request_meta_with_current_user = RequestMeta::where('user_id', auth()->user()->id);
-        $check_request_data_with_user = $request_meta_with_current_user->exists();
-        if ($check_request_data_with_user) {
-            // get request detail
-            $request_with_user = $request_meta_with_current_user->pluck('request_id')->first();
-            if ($request_with_user) {
-                $this->request->where('id', $request_with_user)->update(['is_cancelled'=>1,'cancel_method'=>1,'cancelled_at'=>date('Y-m-d H:i:s')]);
-            }
-            // Delete all meta details
-            $request_meta_with_current_user->delete();
+    // Get zone type and service location
+    $zone_type_detail = ZoneType::where('id', $request->vehicle_type)->first();
+    if (!$zone_type_detail) {
+        return $this->respondBadRequest('Invalid vehicle_type');
+    }
+    $type_id = $zone_type_detail->type_id;
+
+    $service_location = $zone_type_detail->zone->serviceLocation;
+    $currency_code = $service_location->currency_code;
+    $currency_symbol = $service_location->currency_symbol;
+
+    // fetch unit from zone
+    $unit = $zone_type_detail->zone->unit;
+
+    // Fetch user detail
+    $user_detail = auth()->user();
+    if ($user_detail->ride_otp == null) {
+        $user_detail->ride_otp = rand(1111, 9999);
+    }
+    $user_detail->timezone = $service_location->timezone;
+    $user_detail->save();
+
+    // Generate request number
+    $current_timestamp = Carbon::now()->timestamp . rand(0, 99);
+    $request_number = 'REQ_' . $current_timestamp;
+
+    // ETA result using transformer (existing code)
+    $eta_result = fractal($zone_type_detail, new EtaTransformer);
+    $eta_result = json_decode($eta_result->toJson());
+
+    // ========== PRICE PER TIME FIX ==========
+    // Determine price_per_time from:
+    // 1) incoming request (if provided)
+    // 2) zone_type_detail attribute (if present)
+    // 3) fallback to 0 (safe default to avoid DB NOT NULL constraint violation)
+    //
+    // TODO: Replace fallback/default with your proper fare calculation if required
+    $pricePerTime = null;
+    if ($request->has('price_per_time') && $request->price_per_time !== null) {
+        $pricePerTime = $request->price_per_time;
+    } elseif (isset($zone_type_detail->price_per_time) && $zone_type_detail->price_per_time !== null) {
+        $pricePerTime = $zone_type_detail->price_per_time;
+    } else {
+        // Fallback default to avoid null insertion; change if business requires non-zero.
+        $pricePerTime = 0;
+    }
+
+    // Basic sanitization / cast
+    if (!is_numeric($pricePerTime)) {
+        // Try to coerce numeric strings; otherwise fallback 0
+        $pricePerTime = floatval($pricePerTime) ?: 0;
+    }
+
+    // =========================================
+
+    $request_params = [
+        'request_number' => $request_number,
+        'user_id' => $user_detail->id,
+        'zone_type_id' => $request->vehicle_type,
+        'payment_opt' => $request->payment_opt,
+        'unit' => (string)$unit,
+        'promo_id' => $request->promocode_id,
+        'requested_currency_code' => $currency_code,
+        'requested_currency_symbol' => $currency_symbol,
+        'service_location_id' => $service_location->id,
+        'timezone' => $service_location->timezone,
+        'ride_otp' => $user_detail->ride_otp,
+        'poly_line' => $request->poly_line,
+        'total_time' => $eta_result->data->time,
+        'total_distance' => $eta_result->data->distance,
+        'is_surge_applied' => $eta_result->data->is_surge_applied,
+        // fixed field to avoid DB integrity error
+        'price_per_time' => $pricePerTime,
+    ];
+
+    if ($request->has('card_token')) {
+        $request_params['card_token'] = $request->card_token;
+    }
+    if ($request->has('is_pet_available')) {
+        $request_params['is_pet_available'] = $request->is_pet_available == 'true' ? 1 : 0;
+    }
+    if ($request->has('is_airport')) {
+        $request_params['is_airport'] = 1;
+    }
+    if ($request->has('is_luggage_available')) {
+        $request_params['is_luggage_available'] = $request->is_luggage_available == 'true' ? 1 : 0;
+    }
+
+    $request_params['offerred_ride_fare'] = 0;
+
+    $app_for = config('app.app_for');
+    if ($app_for != 'taxi' || $app_for != 'delivery') {
+        $request_params['transport_type'] = 'taxi';
+    }
+
+    if ($request->has('is_bid_ride') && $request->input('is_bid_ride') == 1) {
+        $request_params['is_bid_ride'] = 1;
+        $request_params['offerred_ride_fare'] = $request->offerred_ride_fare;
+    }
+
+    if ($request->has('rental_pack_id') && $request->rental_pack_id) {
+        $request_params['is_rental'] = true;
+        $request_params['rental_package_id'] = $request->rental_pack_id;
+    }
+
+    if ($request->has('myself') && $request->input('myself') == 0) {
+        $request_params['book_for_other'] = 1;
+        if (!$request->has('contact_no_other') || $request->input('contact_no_other') == null) {
+            $this->throwCustomException('please provide the valid contact');
         }
-        // get type id
-        $zone_type_detail = ZoneType::where('id', $request->vehicle_type)->first();
-        $type_id = $zone_type_detail->type_id;
+        $request_params['book_for_other_contact'] = $request->input('contact_no_other');
+    }
 
-        // Get currency code of Request
-        $service_location = $zone_type_detail->zone->serviceLocation;
-        $currency_code = $service_location->currency_code;
-        $currency_symbol = $service_location->currency_symbol;
+    if (!$request->drop_lat) {
+        $request_params['is_without_destination'] = true;
+    }
+    $request_params['company_key'] = auth()->user()->company_key;
 
-        // $currency_code = get_settings('currency_code');
-        //Find the zone using the pickup coordinates & get the nearest drivers
+    if ($request->has('discounted_total') && $request->discounted_total) {
+        $request_params['discounted_total'] = $request->discounted_total;
+        $request_params['rental_package_id'] = $request->rental_pack_id;
+    }
 
+    if ($request->has('request_eta_amount') && $request->request_eta_amount) {
+        $request_params['request_eta_amount'] = $request->request_eta_amount;
+    }
 
-        // fetch unit from zone
-        $unit = $zone_type_detail->zone->unit;
-        // Fetch user detail
-        $user_detail = auth()->user();
-
-        if($user_detail->ride_otp==null)
-        {
-            $user_detail->ride_otp=rand(1111, 9999);
-
-        }
-
-        $user_detail->timezone = $service_location->timezone;
-        $user_detail->save();
-
-        // Get last request's request_number
-        // $request_number = $this->request->orderBy('created_at', 'DESC')->pluck('request_number')->first();
-        // if ($request_number) {
-        //     $request_number = explode('_', $request_number);
-        //     $request_number = $request_number[1]?:000000;
-        // } else {
-        //     $request_number = 000000;
-        // }
-        // // Generate request number
-        // $request_number = 'REQ_'.sprintf("%06d", $request_number+1);
-
-        $current_timestamp = Carbon::now()->timestamp.rand(0, 99);
-
-        $request_number = 'REQ_'.$current_timestamp;
-
-        $eta_result = fractal($zone_type_detail, new EtaTransformer);
-
-        $eta_result =json_decode($eta_result->toJson());
-
-
-        $request_params = [
-            'request_number'=>$request_number,
-            'user_id'=>$user_detail->id,
-            'zone_type_id'=>$request->vehicle_type,
-            'payment_opt'=>$request->payment_opt,
-            'unit'=>(string)$unit,
-            'promo_id'=>$request->promocode_id,
-            'requested_currency_code'=>$currency_code,
-            'requested_currency_symbol'=>$currency_symbol,
-            'service_location_id'=>$service_location->id,
-            'timezone'=>$service_location->timezone,
-            'ride_otp'=>$user_detail->ride_otp,
-            'poly_line'=>$request->poly_line,
-            'total_time'=>$eta_result->data->time,
-            'total_distance'=>$eta_result->data->distance,
-            'is_surge_applied'=>$eta_result->data->is_surge_applied,
-        ];
-
-        if($request->has('card_token')){
-
-            $request_params['card_token'] = $request->card_token;
-
-        }
-        if($request->has('is_pet_available')){
-
-            $request_params['is_pet_available'] = $request->is_pet_available =='true' ? 1 : 0;
-        }
-
-        if($request->has('is_airport')){
-
-            $request_params['is_airport'] = 1;
-
-        }
-        if($request->has('is_luggage_available')){
-
-            $request_params['is_luggage_available'] = $request->is_luggage_available =='true' ? 1 : 0;
-        }
-
-        $request_params['offerred_ride_fare']=0;
-
-        $app_for = config('app.app_for');
-
-
-        if($app_for!='taxi' || $app_for!='delivery')
-         {
-            $request_params['transport_type']='taxi';
-            
-         }
-
-
-        if($request->has('is_bid_ride') && $request->input('is_bid_ride')==1){
-
-            $request_params['is_bid_ride']=1;
-            $request_params['offerred_ride_fare']=$request->offerred_ride_fare;
-        }
-
-
-        if($request->has('rental_pack_id') && $request->rental_pack_id){
-
-            $request_params['is_rental'] = true;
-
-            $request_params['rental_package_id'] = $request->rental_pack_id;
-        }
-
-        if($request->has('myself') && $request->input('myself')==0){
-
-            $request_params['book_for_other'] = 1;
-
-            if(!$request->has('contact_no_other') || $request->input('contact_no_other')==null){
-
-                $this->throwCustomException('please provide the valid contact');
-
-            }
-            $request_params['book_for_other_contact'] = $request->input('contact_no_other');
-
-        }
-
-        if(!$request->drop_lat){
-            $request_params['is_without_destination'] = true;
-        }
-        $request_params['company_key'] = auth()->user()->company_key;
-
-        if($request->has('discounted_total') && $request->discounted_total){
-
-            $request_params['discounted_total'] = $request->discounted_total;
-
-            $request_params['rental_package_id'] = $request->rental_pack_id;
-        }
-       
-        if($request->has('request_eta_amount') && $request->request_eta_amount){
-
-            $request_params['request_eta_amount'] = $request->request_eta_amount;
-
-        }
-
-        // Log::info($request_params);
-        
-        // store request details to db
-        // DB::beginTransaction();
-        // try {
-        // $request_detail = $this->request->create($request_params);
-
-        if($request->has('card_token') && !$request->is_bid_ride && get_payment_settings('enable_stripe_authorization') == '1'){
-            $preAuthorize = $this->authorizeAmount($request->request_eta_amount,$currency_code,$request->card_token);
-            if($preAuthorize){
-                $request_params['payment_intent_id']=$preAuthorize->id;
+    // Start DB transaction for atomicity
+    DB::beginTransaction();
+    try {
+        // Pre-authorize card if required
+        if ($request->has('card_token') && !$request->is_bid_ride && get_payment_settings('enable_stripe_authorization') == '1') {
+            $preAuthorize = $this->authorizeAmount($request->request_eta_amount, $currency_code, $request->card_token);
+            if ($preAuthorize) {
+                $request_params['payment_intent_id'] = $preAuthorize->id;
                 $request_detail = $this->request->create($request_params);
-            }else{
+            } else {
+                // Don't create request if authorization fails
+                DB::rollBack();
                 $this->throwCustomException('Insufficient Balance Amount');
             }
-        }else{
+        } else {
             $request_detail = $this->request->create($request_params);
         }
 
-               
-        $this->storeEta($request_detail , $eta_result);
-        
+        // Store ETA & preferences
+        $this->storeEta($request_detail, $eta_result);
+
         if ($request->has('preferences')) {
-            $this->storePreference($request_detail , json_decode($request->preferences));
+            $this->storePreference($request_detail, json_decode($request->preferences));
         }
 
-        if($request->promocode_id) {
+        // Redeem promo if any
+        if ($request->promocode_id) {
             $promo = Promo::find($request->promocode_id);
-            $promo->update([
-                'total_uses' => $promo->total_uses+1,
-            ]);
-            $promo_params = [
-                'promo_code_id' => $request->promocode_id,
-                'request_id' => $request_detail->id,
-                'user_id' => $user_detail->id,
-            ];
-            PromoUser::create($promo_params);
-        }
-          // To Store Request stops along with poc details
-        if ($request->has('stops')) {
-
-            // Log::info($request->stops);
-
-            foreach (json_decode($request->stops) as $key => $stop) {
-                $request_detail->requestStops()->create([
-                'address'=>$stop->address,
-                'latitude'=>$stop->latitude,
-                'longitude'=>$stop->longitude,
-                'poc_instruction'=>$stop->poc_instruction,
-                'order'=>$stop->order]);
-
+            if ($promo) {
+                $promo->update([
+                    'total_uses' => $promo->total_uses + 1,
+                ]);
+                $promo_params = [
+                    'promo_code_id' => $request->promocode_id,
+                    'request_id' => $request_detail->id,
+                    'user_id' => $user_detail->id,
+                ];
+                PromoUser::create($promo_params);
             }
         }
-        
-        // request place detail params
-        $request_place_params = [
-            'pick_lat'=>$request->pick_lat,
-            'pick_lng'=>$request->pick_lng,
-            'drop_lat'=>$request->drop_lat,
-            'drop_lng'=>$request->drop_lng,
-            'pickup_poc_instruction'=>$request->pickup_poc_instruction,
-            'drop_poc_instruction'=>$request->drop_poc_instruction,
-            'pick_address'=>$request->pick_address,
-            'drop_address'=>$request->drop_address];
+
+        // Store stops if present
+        if ($request->has('stops')) {
+            foreach (json_decode($request->stops) as $key => $stop) {
+                $request_detail->requestStops()->create([
+                    'address' => $stop->address,
+                    'latitude' => $stop->latitude,
+                    'longitude' => $stop->longitude,
+                    'poc_instruction' => $stop->poc_instruction,
+                    'order' => $stop->order
+                ]);
+            }
+        }
+
         // store request place details
+        $request_place_params = [
+            'pick_lat' => $request->pick_lat,
+            'pick_lng' => $request->pick_lng,
+            'drop_lat' => $request->drop_lat,
+            'drop_lng' => $request->drop_lng,
+            'pickup_poc_instruction' => $request->pickup_poc_instruction,
+            'drop_poc_instruction' => $request->drop_poc_instruction,
+            'pick_address' => $request->pick_address,
+            'drop_address' => $request->drop_address
+        ];
         $request_detail->requestPlace()->create($request_place_params);
 
         // Add Request detail to firebase database
-         $this->database->getReference('requests/'.$request_detail->id)->update(['request_id'=>$request_detail->id,'request_number'=>$request_detail->request_number,'service_location_id'=>$service_location->id,'user_id'=>$request_detail->user_id,'pick_address'=>$request->pick_address,'drop_address'=>$request->drop_address,'active'=>1,'date'=>$request_detail->converted_created_at,'updated_at'=> Database::SERVER_TIMESTAMP]);
+        $this->database->getReference('requests/' . $request_detail->id)->update([
+            'request_id' => $request_detail->id,
+            'request_number' => $request_detail->request_number,
+            'service_location_id' => $service_location->id,
+            'user_id' => $request_detail->user_id,
+            'pick_address' => $request->pick_address,
+            'drop_address' => $request->drop_address,
+            'active' => 1,
+            'date' => $request_detail->converted_created_at,
+            'updated_at' => Database::SERVER_TIMESTAMP
+        ]);
 
+        // Commit after everything successful
+        DB::commit();
 
-        $request_detail = $this->request->where('id',$request_detail->id)->first();
-
-        // Log::info($request_detail);
-
-        $request_result =  fractal($request_detail, new TripRequestTransformer)->parseIncludes('userDetail');
-
-
-        if ($request->has('is_bid_ride') && $request->input('is_bid_ride')==1) {
-                goto no_drivers_available;
-        }
-
-        $nearest_drivers =  $this->fetchDriversFromFirebase($request_detail,$this->database);
-
-        // Send Request to the nearest Drivers
-         if ($nearest_drivers==null) {
-                goto no_drivers_available;
-            }
-
-        no_drivers_available:
-
-        // @TODO send sms & email to the user
-        // } catch (\Exception $e) {
-        //     DB::rollBack();
-        //     Log::error($e);
-        //     Log::error('Error while Create new request. Input params : ' . json_encode($request->all()));
-        //     return $this->respondBadRequest('Unknown error occurred. Please try again later or contact us if it continues.');
-        // }
-        // DB::commit();
-        $service_location = $zone_type_detail->zone->serviceLocation;
-        $timezone = $service_location->timezone?:env('SYSTEM_DEFAULT_TIMEZONE');
-
-        if(get_settings('enable_peak_zone_feature') == 1){
-            dispatch(new ValidateAndGeneratePeakZone($request->pick_lat,$request->pick_lng,$zone_type_detail->zone_id,$timezone));
-        }
-
-
-
-        return $this->respondSuccess($request_result, 'created_request_successfully');
+    } catch (\Exception $e) {
+        DB::rollBack();
+        // Helpful logging for debugging
+        Log::error('Error while creating new request', [
+            'error' => $e->getMessage(),
+            'input' => $request->all(),
+            'request_params' => $request_params
+        ]);
+        // Re-throw or respond - keeping your earlier behavior of throwing user-facing message
+        return $this->respondBadRequest('Unknown error occurred. Please try again later or contact us if it continues.');
     }
+
+    // Reload request and prepare response (existing behavior)
+    $request_detail = $this->request->where('id', $request_detail->id)->first();
+    $request_result = fractal($request_detail, new TripRequestTransformer)->parseIncludes('userDetail');
+
+    if ($request->has('is_bid_ride') && $request->input('is_bid_ride') == 1) {
+        goto no_drivers_available;
+    }
+
+    $nearest_drivers = $this->fetchDriversFromFirebase($request_detail, $this->database);
+
+    if ($nearest_drivers == null) {
+        goto no_drivers_available;
+    }
+
+    no_drivers_available:
+
+    // Optional: dispatch peak zone job (existing code)
+    $service_location = $zone_type_detail->zone->serviceLocation;
+    $timezone = $service_location->timezone ?: env('SYSTEM_DEFAULT_TIMEZONE');
+
+    if (get_settings('enable_peak_zone_feature') == 1) {
+        dispatch(new ValidateAndGeneratePeakZone($request->pick_lat, $request->pick_lng, $zone_type_detail->zone_id, $timezone));
+    }
+
+    return $this->respondSuccess($request_result, 'created_request_successfully');
+}
 
     /**
     * Create Ride later trip
