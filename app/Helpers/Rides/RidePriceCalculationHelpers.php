@@ -156,7 +156,7 @@ trait RidePriceCalculationHelpers
         $price_per_time = (double)$type_prices->price_per_time;
         
         if(request()->has('is_out_station') && request()->is_out_station){
-            $price_per_time = $type_prices->time_price_per_min;
+            $price_per_time = $type_prices->outstation_price_per_time;
             // Log::info("Driver True");
    
            }
