@@ -89,11 +89,7 @@ export default {
     }
     
     watch(userSearch, debounce(function () {
-      if(userSearch.value.length > 0){
-        fetchUsers();
-      }else{
-        users.value = [];
-      }
+      fetchUsers();
     }, 300));
 
     const validationRules = {
@@ -157,6 +153,10 @@ export default {
     onMounted(() => {
       if (props.promo) {
         form.date = [ props.promo.from?.split(" ")?.[0], props.promo.to?.split(" ")?.[0],];
+      }
+      // Fetch initial users on mount
+      if (users.value.length === 0) {
+        fetchUsers();
       }
     });
 
