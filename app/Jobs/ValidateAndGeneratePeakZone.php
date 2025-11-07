@@ -94,7 +94,7 @@ class ValidateAndGeneratePeakZone implements ShouldQueue
 
         $ride_count = $nearest_rides->count();
 
-        if($minimum_no_rides>$ride_count){
+        if($minimum_no_rides>$ride_count || $ride_count == 0){
 
             goto end;
 
