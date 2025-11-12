@@ -2344,6 +2344,8 @@ class RolesAndPermissionsSeeder extends Seeder
                 permissionSlug::ACCESS_USER_NAV_LIST,
                 PermissionSlug::VIEW_SUPPORT_MANAGEMENT,
                 PermissionSlug::VIEW_SUPPORT_TICKET,
+                 PermissionSlug::ADMIN,
+                PermissionSlug::ACCESS_DASHBOARD,
             ],
         ],
     ];
