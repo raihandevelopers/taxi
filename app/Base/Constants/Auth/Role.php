@@ -62,6 +62,7 @@ class Role
     {
         return [
             self::SUPER_ADMIN,
+            self::EMPLOYEE,
 
         ];
     }
