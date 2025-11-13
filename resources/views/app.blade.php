@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title inertia>{{ app_name() ?? 'Restart' }} - Admin App</title>
+    <title inertia>{{ app_name() ?? 'Appzeto' }}</title>
 
     <!-- App favicon -->
     <!-- <link rel="shortcut icon" href="{{ URL::asset('image/favicon.ico') }}"> -->

@@ -12,6 +12,6 @@ npm-debug.log
 yarn-error.log
 /.fleet
 /.idea
-/.vscode
 package-lock.json
 
+config.bat
